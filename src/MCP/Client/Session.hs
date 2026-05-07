@@ -26,11 +26,15 @@ import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.Text (Text)
 import Data.Text qualified as T
-import JSONRPC
+import JSONRPC hiding (id, method, params, result)
 import MCP.Client.Config (ClientConfig (..))
 import MCP.Client.Error (MCPClientError (..))
 import MCP.Client.Transport (Transport (..))
 import MCP.Protocol
+  ( InitializeParams(..)
+  , InitializeResult(..)
+  , pROTOCOL_VERSION
+  )
 import MCP.Types
 import System.Timeout (timeout)
 

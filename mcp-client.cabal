@@ -1,7 +1,7 @@
 cabal-version: 2.2
 name: mcp-client
 version: 0.1.0.0
-license: BSD3
+license: BSD-3-Clause
 license-file: LICENSE
 copyright: (c) 2025 DPella AB
 author: DPella AB
@@ -36,14 +36,18 @@ library
 
   default-extensions:
     DataKinds
+    DisambiguateRecordFields
+    DuplicateRecordFields
     FlexibleInstances
     GADTs
     GeneralizedNewtypeDeriving
     ImportQualifiedPost
     LambdaCase
+    NumericUnderscores
     OverloadedStrings
     PolyKinds
     RankNTypes
+    ScopedTypeVariables
     TypeApplications
     TypeFamilies
 
@@ -106,6 +110,5 @@ test-suite test-mcp-client
     hspec >=2.10 && <2.12,
     mcp-client,
     mcp-types >=0.1.0 && <0.2,
-    mcp,
     process >=1.6 && <1.8,
     text >=2.0 && <2.2,

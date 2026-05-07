@@ -28,19 +28,42 @@ import Data.Aeson qualified as Aeson
 import Data.Map (Map)
 import Data.Text (Text)
 import Data.Text qualified as T
-import JSONRPC
+import JSONRPC hiding (id, method, params, result)
 import MCP.Client.Error (MCPClientError (..))
 import MCP.Client.Session (ClientSession)
 import MCP.Client.Session qualified as Session
 import MCP.Protocol
-import MCP.Types
+  ( CancelledParams(CancelledParams)
+  , CompleteParams
+  , CompleteResult
+  , GetPromptParams(GetPromptParams)
+  , GetPromptResult
+  , ListPromptsParams(ListPromptsParams)
+  , ListPromptsResult
+  , ListResourceTemplatesParams(ListResourceTemplatesParams)
+  , ListResourceTemplatesResult
+  , ListResourcesParams(ListResourcesParams)
+  , ListResourcesResult
+  , ListToolsParams(ListToolsParams)
+  , ListToolsResult
+  , PingParams(PingParams)
+  , ProgressParams
+  , ReadResourceParams(ReadResourceParams)
+  , ReadResourceResult
+  , SetLevelParams(SetLevelParams)
+  , SubscribeParams(SubscribeParams)
+  , UnsubscribeParams(UnsubscribeParams)
+  , CallToolParams(CallToolParams)
+  , CallToolResult
+  )
+import MCP.Types (Cursor, LoggingLevel)
 
 -- * Client-to-server requests
 
 -- | Send a @ping@ request.
 ping :: ClientSession -> IO ()
 ping session = do
-  _ <- sendRequestTyped session "ping" (toJSON (PingParams Nothing))
+  (_ :: Value) <- sendRequestTyped session "ping" (toJSON (PingParams Nothing))
   return ()
 
 -- | List available tools.  Pass 'Nothing' for the first page.
@@ -64,12 +87,12 @@ readResource session uri =
   sendRequestTyped session "resources/read" (toJSON (ReadResourceParams uri))
 
 -- | Subscribe to updates for a resource URI.
-subscribeResource :: ClientSession -> Text -> IO Result
+subscribeResource :: ClientSession -> Text -> IO Value
 subscribeResource session uri =
   sendRequestTyped session "resources/subscribe" (toJSON (SubscribeParams uri))
 
 -- | Unsubscribe from updates for a resource URI.
-unsubscribeResource :: ClientSession -> Text -> IO Result
+unsubscribeResource :: ClientSession -> Text -> IO Value
 unsubscribeResource session uri =
   sendRequestTyped session "resources/unsubscribe" (toJSON (UnsubscribeParams uri))
 

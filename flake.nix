@@ -11,29 +11,8 @@
         (final: prev: {
           mcp-client-project =
             final.haskell-nix.cabalProject' {
-              # Filter the source to exclude cabal.project and
-              # cabal.project.freeze — they pull in the server packages
-              # (and thus jose 0.11 which doesn't compile here).
-              # We provide our own cabalProject string below.
-              src = builtins.path {
-                path = ./..;
-                name = "mcp-src";
-                filter = path: type:
-                  let base = builtins.baseNameOf path; in
-                  base != "cabal.project" &&
-                  base != "cabal.project.freeze" &&
-                  base != "cabal.project.local" &&
-                  base != ".git";
-              };
-              # Match pureclaw's GHC to reuse the already-built compiler
+              src = ./.;
               compiler-nix-name = "ghc9123";
-              # Only build mcp-types + mcp-client (not mcp-server).
-              # mcp-server depends on jose 0.11 via servant-auth-server,
-              # and jose 0.11 doesn't compile in this haskell.nix snapshot.
-              # Tests disabled since test suite depends on the server.
-              cabalProject = builtins.readFile (./.. + "/cabal-nix.project");
-              cabalProjectLocal = "";
-              cabalProjectFreeze = "";
               shell.withHoogle = false;
               shell.exactDeps = true;
               shell.tools = {
