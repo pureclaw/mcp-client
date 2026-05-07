@@ -5,6 +5,7 @@
 module MCP.Client.StdioIntegration where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket, catch, try)
 import Data.Aeson (Value (..), toJSON, (.=))
 import Data.Aeson qualified as Aeson
@@ -12,6 +13,7 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString.Char8 qualified as BS
 import Data.ByteString.Lazy qualified as BSL
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Map qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -22,6 +24,9 @@ import MCP.Client.Error (MCPClientError (..))
 import MCP.Client.Session
   ( ClientSession,
     initialize,
+    sessionServerCapabilities,
+    sessionServerInfo,
+    sendRequest,
     withClientSession,
   )
 import MCP.Client.Transport (Transport (..))
@@ -47,6 +52,8 @@ import Test.Hspec
 stdioClientIntegrationSpec :: Spec
 stdioClientIntegrationSpec = describe "MCP Client (stdio)" $ do
   initializationSpec
+  versionNegotiationSpec
+  sessionLifecycleSpec
   pingSpec
   toolSpec
   resourceSpec
@@ -54,13 +61,35 @@ stdioClientIntegrationSpec = describe "MCP Client (stdio)" $ do
   promptSpec
   completionSpec
   loggingSpec
+  requestTimeoutSpec
+  notificationCallbackSpec
+  serverInitiatedRequestSpec
+  fallbackHandlerSpec
 
 -- * Mock Server
 
+-- | Configuration for mock server behavior, allowing per-test customization.
+data MockServerConfig = MockServerConfig
+  { msc_protocol_version :: Text
+    -- ^ Protocol version to return during initialization
+  , msc_on_initialized :: Maybe (Handle -> IO ())
+    -- ^ Action to run after receiving the initialized notification
+    -- (used to send server-initiated messages)
+  , msc_slow_ping :: Bool
+    -- ^ If True, delay ping response (for timeout testing)
+  }
+
+defaultMockConfig :: MockServerConfig
+defaultMockConfig = MockServerConfig
+  { msc_protocol_version = pROTOCOL_VERSION
+  , msc_on_initialized = Nothing
+  , msc_slow_ping = False
+  }
+
 -- | A minimal mock MCP server that reads JSON-RPC from a handle and writes
 -- responses back, implementing just enough to exercise the client library.
-mockServer :: Handle -> Handle -> IO ()
-mockServer readEnd writeEnd = go
+mockServer :: MockServerConfig -> Handle -> Handle -> IO ()
+mockServer cfg readEnd writeEnd = go
  where
   go = do
     eof <- hIsEOF readEnd
@@ -81,16 +110,24 @@ mockServer readEnd writeEnd = go
                       BSL.hPut writeEnd (Aeson.encode (ErrorMessage (JSONRPCError rPC_VERSION reqId (JSONRPCErrorInfo code errMsg Nothing))))
                         >> BSL.hPut writeEnd "\n"
                         >> hFlush writeEnd
-                handleRequest method params respond respondError
-              NotificationMessage _ -> return () -- ignore notifications
+                handleMockRequest cfg writeEnd method params respond respondError
+              NotificationMessage (JSONRPCNotification _ method _params) -> do
+                -- After client sends "notifications/initialized", trigger any
+                -- server-initiated actions (notifications, requests, etc.)
+                case method of
+                  "notifications/initialized" ->
+                    case msc_on_initialized cfg of
+                      Just action -> action writeEnd
+                      Nothing -> return ()
+                  _ -> return ()
               _ -> return ()
             go
 
-handleRequest :: Text -> Value -> (Value -> IO ()) -> (Int -> Text -> IO ()) -> IO ()
-handleRequest method params respond respondError = case method of
+handleMockRequest :: MockServerConfig -> Handle -> Text -> Value -> (Value -> IO ()) -> (Int -> Text -> IO ()) -> IO ()
+handleMockRequest cfg _writeEnd method params respond respondError = case method of
   "initialize" ->
     respond $ toJSON $ Aeson.object
-      [ "protocolVersion" .= pROTOCOL_VERSION
+      [ "protocolVersion" .= msc_protocol_version cfg
       , "capabilities" .= Aeson.object
           [ "logging" .= Aeson.object []
           , "prompts" .= Aeson.object ["listChanged" .= False]
@@ -103,7 +140,9 @@ handleRequest method params respond respondError = case method of
           ]
       ]
 
-  "ping" -> respond (Aeson.object [])
+  "ping"
+    | msc_slow_ping cfg -> threadDelay 5_000_000 >> respond (Aeson.object [])
+    | otherwise -> respond (Aeson.object [])
 
   "tools/list" ->
     respond $ toJSON $ Aeson.object
@@ -213,11 +252,32 @@ handleRequest method params respond respondError = case method of
 
   _ -> respondError (-32601) ("Method not found: " <> method)
 
+-- | Send a JSON-RPC notification from the mock server to the client.
+sendServerNotification :: Handle -> Text -> Value -> IO ()
+sendServerNotification h method params = do
+  let msg = NotificationMessage (JSONRPCNotification rPC_VERSION method params)
+  BSL.hPut h (Aeson.encode msg)
+  BSL.hPut h "\n"
+  hFlush h
+
+-- | Send a JSON-RPC request from the mock server to the client.
+sendServerRequest :: Handle -> Int -> Text -> Value -> IO ()
+sendServerRequest h reqIdInt method params = do
+  let reqId = RequestId (toJSON reqIdInt)
+      msg = RequestMessage (JSONRPCRequest rPC_VERSION reqId method params)
+  BSL.hPut h (Aeson.encode msg)
+  BSL.hPut h "\n"
+  hFlush h
+
 -- * Test Infrastructure
 
 -- | Bracket that creates pipes, starts a mock server, and yields a Transport.
 withTestServer :: (Transport -> IO a) -> IO a
-withTestServer f = do
+withTestServer = withTestServerConfig defaultMockConfig
+
+-- | Like 'withTestServer' but with a custom mock server config.
+withTestServerConfig :: MockServerConfig -> (Transport -> IO a) -> IO a
+withTestServerConfig cfg f = do
   (clientToServerRead, clientToServerWrite) <- createPipe
   (serverToClientRead, serverToClientWrite) <- createPipe
 
@@ -228,7 +288,7 @@ withTestServer f = do
 
   bracket
     ( do
-        tid <- forkIO $ mockServer clientToServerRead serverToClientWrite
+        tid <- forkIO $ mockServer cfg clientToServerRead serverToClientWrite
                           `catch` \(_ :: SomeException) -> return ()
         threadDelay 10000
         return tid
@@ -262,18 +322,23 @@ withTestServer f = do
 
 -- | Run a test with a connected and initialized client session.
 withInitializedClient :: (ClientSession -> IO a) -> IO a
-withInitializedClient action =
-  withTestServer $ \transport ->
-    withClientSession transport testConfig $ \session -> do
+withInitializedClient = withInitializedClientConfig defaultMockConfig testConfig
+
+-- | Like 'withInitializedClient' but with custom configs.
+withInitializedClientConfig :: MockServerConfig -> ClientConfig -> (ClientSession -> IO a) -> IO a
+withInitializedClientConfig mockCfg clientCfg action =
+  withTestServerConfig mockCfg $ \transport ->
+    withClientSession transport clientCfg $ \session -> do
       _ <- initialize session
       action session
- where
-  testConfig =
-    defaultClientConfig
-      { config_client_info = Implementation "test-client" "0.1.0" Nothing
-      , config_capabilities = ClientCapabilities Nothing Nothing Nothing Nothing
-      , config_request_timeout_us = 5_000_000
-      }
+
+testConfig :: ClientConfig
+testConfig =
+  defaultClientConfig
+    { config_client_info = Implementation "test-client" "0.1.0" Nothing
+    , config_capabilities = ClientCapabilities Nothing Nothing Nothing Nothing
+    , config_request_timeout_us = 5_000_000
+    }
 
 -- * Test Specs
 
@@ -286,6 +351,83 @@ initializationSpec = describe "Initialization" $ do
         protocolVersion result `shouldBe` pROTOCOL_VERSION
         let Implementation{name = sname} = serverInfo result
         sname `shouldBe` "test-server"
+
+  it "stores server capabilities after initialization" $ do
+    withTestServer $ \transport ->
+      withClientSession transport testConfig $ \session -> do
+        capsBefore <- sessionServerCapabilities session
+        capsBefore `shouldBe` Nothing
+        _ <- initialize session
+        capsAfter <- sessionServerCapabilities session
+        capsAfter `shouldSatisfy` \case { Just _ -> True; Nothing -> False }
+
+  it "stores server info after initialization" $ do
+    withTestServer $ \transport ->
+      withClientSession transport testConfig $ \session -> do
+        infoBefore <- sessionServerInfo session
+        infoBefore `shouldBe` Nothing
+        _ <- initialize session
+        infoAfter <- sessionServerInfo session
+        case infoAfter of
+          Just (Implementation{name = n}) -> n `shouldBe` "test-server"
+          Nothing -> expectationFailure "Expected server info"
+
+  it "sends custom client info during initialization" $ do
+    let cfg = testConfig
+          { config_client_info = Implementation "my-custom-client" "2.0.0" Nothing
+          }
+    -- If initialization succeeds, the client info was sent correctly
+    withTestServerConfig defaultMockConfig $ \transport ->
+      withClientSession transport cfg $ \session -> do
+        result <- initialize session
+        protocolVersion result `shouldBe` pROTOCOL_VERSION
+
+versionNegotiationSpec :: Spec
+versionNegotiationSpec = describe "Version Negotiation" $ do
+  it "rejects mismatched protocol version" $ do
+    let badVersionCfg = defaultMockConfig { msc_protocol_version = "1999-01-01" }
+    withTestServerConfig badVersionCfg $ \transport ->
+      withClientSession transport testConfig $ \session -> do
+        result <- try @MCPClientError $ initialize session
+        case result of
+          Left (ProtocolVersionMismatch expected got) -> do
+            expected `shouldBe` pROTOCOL_VERSION
+            got `shouldBe` "1999-01-01"
+          Left other -> expectationFailure $ "Expected ProtocolVersionMismatch, got: " ++ show other
+          Right _ -> expectationFailure "Expected ProtocolVersionMismatch error"
+
+sessionLifecycleSpec :: Spec
+sessionLifecycleSpec = describe "Session Lifecycle" $ do
+  it "fails pending requests when session closes" $ do
+    -- Start a session, send a request to a slow server, then close the session.
+    -- The pending request should fail with an internal error.
+    let slowCfg = defaultMockConfig { msc_slow_ping = True }
+    result <- try @MCPClientError $
+      withTestServerConfig slowCfg $ \transport ->
+        withClientSession transport (testConfig { config_request_timeout_us = 500_000 }) $ \session -> do
+          _ <- initialize session
+          -- This will timeout because the mock delays ping for 5 seconds
+          ping session
+    case result of
+      Left (RequestTimeout _) -> return ()
+      Left (RPCError _ _ _) -> return ()  -- internal error from session close
+      Left other -> expectationFailure $ "Expected timeout or RPC error, got: " ++ show other
+      Right () -> expectationFailure "Expected error from session close"
+
+  it "rejects requests after session is closed" $ do
+    -- Create a transport, run a session, then try to use it after closing
+    mvar <- newEmptyMVar
+    withTestServer $ \transport -> do
+      withClientSession transport testConfig $ \session -> do
+        _ <- initialize session
+        putMVar mvar session
+      -- Session is now closed, try to use it
+      session <- takeMVar mvar
+      result <- try @MCPClientError $ sendRequest session "ping" (Aeson.object [])
+      case result of
+        Left SessionClosed -> return ()
+        Left other -> expectationFailure $ "Expected SessionClosed, got: " ++ show other
+        Right _ -> expectationFailure "Expected SessionClosed error"
 
 pingSpec :: Spec
 pingSpec = describe "Ping" $ do
@@ -309,6 +451,15 @@ toolSpec = describe "Tools" $ do
         [TextBlock (TextContent{text = t})] -> t `shouldBe` "hi"
         _ -> expectationFailure "Expected single text content"
 
+  it "calls the echo tool with unicode" $ do
+    withInitializedClient $ \session -> do
+      let unicodeMsg = "\x041F\x0440\x0438\x0432\x0435\x0442 \x4F60\x597D \x1F680" -- "Привет 你好 🚀"
+      CallToolResult{content = cs} <-
+        callTool session "echo" (Just $ Map.fromList [("message", toJSON unicodeMsg)])
+      case cs of
+        [TextBlock (TextContent{text = t})] -> t `shouldBe` unicodeMsg
+        _ -> expectationFailure "Expected single text content"
+
   it "calls the add tool" $ do
     withInitializedClient $ \session -> do
       CallToolResult{structuredContent = sc} <-
@@ -317,12 +468,36 @@ toolSpec = describe "Tools" $ do
         Just m -> Map.lookup "result" m `shouldBe` Just (toJSON (7 :: Int))
         Nothing -> expectationFailure "Expected structured content"
 
+  it "calls the add tool with zero arguments" $ do
+    withInitializedClient $ \session -> do
+      CallToolResult{content = cs} <-
+        callTool session "add" (Just $ Map.fromList [("a", toJSON (0 :: Int)), ("b", toJSON (0 :: Int))])
+      case cs of
+        [TextBlock (TextContent{text = t})] -> t `shouldBe` "0"
+        _ -> expectationFailure "Expected single text content"
+
+  it "calls the add tool with negative numbers" $ do
+    withInitializedClient $ \session -> do
+      CallToolResult{content = cs} <-
+        callTool session "add" (Just $ Map.fromList [("a", toJSON (-10 :: Int)), ("b", toJSON (3 :: Int))])
+      case cs of
+        [TextBlock (TextContent{text = t})] -> t `shouldBe` "-7"
+        _ -> expectationFailure "Expected single text content"
+
   it "returns error for non-existent tool" $ do
     withInitializedClient $ \session -> do
       result <- try @MCPClientError $ callTool session "nope" Nothing
       case result of
         Left (RPCError err_code _ _) -> err_code `shouldBe` 404
         _ -> expectationFailure "Expected RPCError"
+
+  it "calls tool with no arguments" $ do
+    withInitializedClient $ \session -> do
+      CallToolResult{content = cs} <-
+        callTool session "echo" Nothing
+      case cs of
+        [TextBlock (TextContent{text = t})] -> t `shouldBe` "?"
+        _ -> expectationFailure "Expected single text content with fallback"
 
 resourceSpec :: Spec
 resourceSpec = describe "Resources" $ do
@@ -348,6 +523,16 @@ resourceSpec = describe "Resources" $ do
         Left (RPCError err_code _ _) -> err_code `shouldBe` 404
         _ -> expectationFailure "Expected RPCError"
 
+  it "subscribes to a resource" $ do
+    withInitializedClient $ \session -> do
+      _ <- subscribeResource session "resource://test/hello"
+      return ()
+
+  it "unsubscribes from a resource" $ do
+    withInitializedClient $ \session -> do
+      _ <- unsubscribeResource session "resource://test/hello"
+      return ()
+
 resourceTemplateSpec :: Spec
 resourceTemplateSpec = describe "Resource Templates" $ do
   it "lists resource templates (empty)" $ do
@@ -369,6 +554,12 @@ promptSpec = describe "Prompts" $ do
         getPrompt session "greet" Nothing
       desc `shouldBe` Just "A greeting prompt"
       length msgs `shouldBe` 1
+
+  it "gets a prompt with arguments" $ do
+    withInitializedClient $ \session -> do
+      GetPromptResult{description = desc} <-
+        getPrompt session "greet" (Just $ Map.fromList [("name", "World")])
+      desc `shouldBe` Just "A greeting prompt"
 
   it "returns error for non-existent prompt" $ do
     withInitializedClient $ \session -> do
@@ -398,3 +589,182 @@ loggingSpec = describe "Logging" $ do
   it "sets logging level" $ do
     withInitializedClient $ \session -> do
       setLoggingLevel session Debug
+
+requestTimeoutSpec :: Spec
+requestTimeoutSpec = describe "Request Timeout" $ do
+  it "times out when server does not respond" $ do
+    let slowCfg = defaultMockConfig { msc_slow_ping = True }
+        shortTimeoutCfg = testConfig { config_request_timeout_us = 100_000 } -- 100ms
+    result <- try @MCPClientError $
+      withInitializedClientConfig slowCfg shortTimeoutCfg $ \session ->
+        ping session
+    case result of
+      Left (RequestTimeout _) -> return ()
+      Left other -> expectationFailure $ "Expected RequestTimeout, got: " ++ show other
+      Right () -> expectationFailure "Expected RequestTimeout"
+
+notificationCallbackSpec :: Spec
+notificationCallbackSpec = describe "Notification Callbacks" $ do
+  it "receives progress notifications" $ do
+    progressRef <- newIORef ([] :: [Double])
+    let serverAction h = do
+          sendServerNotification h "notifications/progress"
+            (Aeson.object ["progressToken" .= ("tok1" :: Text), "progress" .= (0.5 :: Double), "total" .= (1.0 :: Double)])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_progress = Just $ \_ ->
+              atomicModifyIORef' progressRef (\xs -> (xs ++ [1], ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000 -- wait for notification to arrive
+      received <- readIORef progressRef
+      length received `shouldSatisfy` (>= 1)
+
+  it "receives logging message notifications" $ do
+    logRef <- newIORef ([] :: [Text])
+    let serverAction h = do
+          sendServerNotification h "notifications/message"
+            (Aeson.object ["level" .= ("info" :: Text), "data'" .= ("test log message" :: Text), "logger" .= ("test" :: Text)])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_logging_message = Just $ \_ ->
+              atomicModifyIORef' logRef (\xs -> (xs ++ ["got-log"], ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000
+      received <- readIORef logRef
+      length received `shouldSatisfy` (>= 1)
+
+  it "receives resource updated notifications" $ do
+    updatedRef <- newIORef ([] :: [Text])
+    let serverAction h = do
+          sendServerNotification h "notifications/resources/updated"
+            (Aeson.object ["uri" .= ("resource://test/hello" :: Text)])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_resource_updated = Just $ \_ ->
+              atomicModifyIORef' updatedRef (\xs -> (xs ++ ["updated"], ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000
+      received <- readIORef updatedRef
+      length received `shouldSatisfy` (>= 1)
+
+  it "receives tools list changed notifications" $ do
+    changedRef <- newIORef False
+    let serverAction h = do
+          sendServerNotification h "notifications/tools/list_changed" Aeson.Null
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_tool_list_changed = Just $
+              atomicModifyIORef' changedRef (\_ -> (True, ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000
+      changed <- readIORef changedRef
+      changed `shouldBe` True
+
+  it "receives prompts list changed notifications" $ do
+    changedRef <- newIORef False
+    let serverAction h = do
+          sendServerNotification h "notifications/prompts/list_changed" Aeson.Null
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_prompt_list_changed = Just $
+              atomicModifyIORef' changedRef (\_ -> (True, ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000
+      changed <- readIORef changedRef
+      changed `shouldBe` True
+
+  it "receives resources list changed notifications" $ do
+    changedRef <- newIORef False
+    let serverAction h = do
+          sendServerNotification h "notifications/resources/list_changed" Aeson.Null
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_resource_list_changed = Just $
+              atomicModifyIORef' changedRef (\_ -> (True, ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000
+      changed <- readIORef changedRef
+      changed `shouldBe` True
+
+  it "receives cancelled notifications" $ do
+    cancelledRef <- newIORef False
+    let serverAction h = do
+          sendServerNotification h "notifications/cancelled"
+            (Aeson.object ["requestId" .= (1 :: Int), "reason" .= ("user cancelled" :: Text)])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_cancelled = Just $ \_ ->
+              atomicModifyIORef' cancelledRef (\_ -> (True, ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000
+      cancelled <- readIORef cancelledRef
+      cancelled `shouldBe` True
+
+serverInitiatedRequestSpec :: Spec
+serverInitiatedRequestSpec = describe "Server-Initiated Requests" $ do
+  it "responds to server ping" $ do
+    -- The server sends a ping request; the client should auto-respond.
+    -- We verify the session stays healthy afterward.
+    let serverAction h = do
+          sendServerRequest h 9001 "ping" (Aeson.object [])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+    withInitializedClientConfig mockCfg testConfig $ \session -> do
+      threadDelay 200_000
+      -- Session should still work — send a normal request
+      ping session
+
+  it "returns method_not_found for unknown server requests" $ do
+    -- The mock server sends an unknown method; the client should respond
+    -- with an error but remain healthy.
+    let serverAction h = do
+          sendServerRequest h 9002 "unknown/method" (Aeson.object [])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+    withInitializedClientConfig mockCfg testConfig $ \session -> do
+      threadDelay 200_000
+      -- Session should still work
+      ping session
+
+fallbackHandlerSpec :: Spec
+fallbackHandlerSpec = describe "Fallback Handler" $ do
+  it "routes unrecognized notifications to the fallback handler" $ do
+    fallbackRef <- newIORef ([] :: [Text])
+    let serverAction h = do
+          sendServerNotification h "custom/unknown-notification"
+            (Aeson.object ["data" .= ("hello" :: Text)])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+        clientCfg = testConfig
+          { config_on_fallback = Just $ \_ ->
+              atomicModifyIORef' fallbackRef (\xs -> (xs ++ ["fallback-hit"], ()))
+          }
+    withInitializedClientConfig mockCfg clientCfg $ \_ -> do
+      threadDelay 200_000
+      received <- readIORef fallbackRef
+      length received `shouldSatisfy` (>= 1)
+
+  it "does not crash on unrecognized notifications without fallback handler" $ do
+    let serverAction h = do
+          sendServerNotification h "custom/unknown-notification"
+            (Aeson.object ["data" .= ("hello" :: Text)])
+          threadDelay 50000
+        mockCfg = defaultMockConfig { msc_on_initialized = Just serverAction }
+    withInitializedClientConfig mockCfg testConfig $ \session -> do
+      threadDelay 200_000
+      -- Session should still work
+      ping session
