@@ -84,8 +84,10 @@ test-suite test-mcp-client
     FlexibleInstances
     GADTs
     GeneralizedNewtypeDeriving
+    DisambiguateRecordFields
     ImportQualifiedPost
     LambdaCase
+    NumericUnderscores
     OverloadedStrings
     PolyKinds
     RankNTypes
@@ -108,6 +110,7 @@ test-suite test-mcp-client
     bytestring >=0.11 && <0.13,
     containers >=0.6 && <0.8,
     hspec >=2.10 && <2.12,
+    jsonrpc >=0.2.0 && <0.3,
     mcp-client,
     mcp-types >=0.1.0 && <0.2,
     process >=1.6 && <1.8,

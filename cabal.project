@@ -3,7 +3,7 @@ packages:
 
 optimization: 2
 
-tests: False
+tests: True
 
 program-options
   ghc-options:

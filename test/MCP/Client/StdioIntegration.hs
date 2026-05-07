@@ -1,37 +1,48 @@
-{-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS_GHC -Wno-orphans #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# OPTIONS_GHC -Wno-name-shadowing #-}
 
 module MCP.Client.StdioIntegration where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
-import Control.Exception (bracket, try)
-import Data.Aeson (toJSON)
+import Control.Exception (SomeException, bracket, catch, try)
+import Data.Aeson (Value (..), toJSON, (.=))
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString.Char8 qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Map qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import JSONRPC hiding (id, method, params, result)
 import MCP.Client.API
 import MCP.Client.Config (ClientConfig (..), defaultClientConfig)
 import MCP.Client.Error (MCPClientError (..))
-import MCP.Client.Session (
-  ClientSession,
-  initialize,
-  withClientSession,
- )
+import MCP.Client.Session
+  ( ClientSession,
+    initialize,
+    withClientSession,
+  )
 import MCP.Client.Transport (Transport (..))
 import MCP.Protocol
-import MCP.Server
+  ( CallToolResult (..),
+    CompleteParams (..),
+    CompletionArgument (..),
+    GetPromptResult (..),
+    InitializeResult (..),
+    ListPromptsResult (..),
+    ListResourceTemplatesResult (..),
+    ListResourcesResult (..),
+    ListToolsResult (..),
+    ReadResourceResult (..),
+    Reference (PromptRef),
+    pROTOCOL_VERSION,
+  )
 import MCP.Types
-import System.IO (BufferMode (..), hClose, hFlush, hIsEOF, hSetBuffering)
+import System.IO (BufferMode (..), Handle, hClose, hFlush, hIsEOF, hSetBuffering)
 import System.Process (createPipe)
 import Test.Hspec
-
--- We need these type family instances to use the test server.
--- In a real app these would be defined in the application code.
-type instance MCPHandlerState = ()
-type instance MCPHandlerUser = ()
 
 stdioClientIntegrationSpec :: Spec
 stdioClientIntegrationSpec = describe "MCP Client (stdio)" $ do
@@ -44,144 +55,204 @@ stdioClientIntegrationSpec = describe "MCP Client (stdio)" $ do
   completionSpec
   loggingSpec
 
+-- * Mock Server
+
+-- | A minimal mock MCP server that reads JSON-RPC from a handle and writes
+-- responses back, implementing just enough to exercise the client library.
+mockServer :: Handle -> Handle -> IO ()
+mockServer readEnd writeEnd = go
+ where
+  go = do
+    eof <- hIsEOF readEnd
+    if eof
+      then return ()
+      else do
+        line <- BS.hGetLine readEnd
+        case Aeson.eitherDecodeStrict' line of
+          Left _ -> go
+          Right msg -> do
+            case msg of
+              RequestMessage (JSONRPCRequest _ reqId method params) -> do
+                let respond val =
+                      BSL.hPut writeEnd (Aeson.encode (ResponseMessage (JSONRPCResponse rPC_VERSION reqId val)))
+                        >> BSL.hPut writeEnd "\n"
+                        >> hFlush writeEnd
+                    respondError code errMsg =
+                      BSL.hPut writeEnd (Aeson.encode (ErrorMessage (JSONRPCError rPC_VERSION reqId (JSONRPCErrorInfo code errMsg Nothing))))
+                        >> BSL.hPut writeEnd "\n"
+                        >> hFlush writeEnd
+                handleRequest method params respond respondError
+              NotificationMessage _ -> return () -- ignore notifications
+              _ -> return ()
+            go
+
+handleRequest :: Text -> Value -> (Value -> IO ()) -> (Int -> Text -> IO ()) -> IO ()
+handleRequest method params respond respondError = case method of
+  "initialize" ->
+    respond $ toJSON $ Aeson.object
+      [ "protocolVersion" .= pROTOCOL_VERSION
+      , "capabilities" .= Aeson.object
+          [ "logging" .= Aeson.object []
+          , "prompts" .= Aeson.object ["listChanged" .= False]
+          , "resources" .= Aeson.object ["listChanged" .= False, "subscribe" .= False]
+          , "tools" .= Aeson.object ["listChanged" .= True]
+          ]
+      , "serverInfo" .= Aeson.object
+          [ "name" .= ("test-server" :: Text)
+          , "version" .= ("1.0.0" :: Text)
+          ]
+      ]
+
+  "ping" -> respond (Aeson.object [])
+
+  "tools/list" ->
+    respond $ toJSON $ Aeson.object
+      [ "tools" .= [ Aeson.object
+            [ "name" .= ("echo" :: Text)
+            , "description" .= ("Echo tool" :: Text)
+            , "inputSchema" .= Aeson.object
+                [ "type" .= ("object" :: Text)
+                , "properties" .= Aeson.object ["message" .= Aeson.object ["type" .= ("string" :: Text)]]
+                , "required" .= (["message"] :: [Text])
+                ]
+            ]
+          , Aeson.object
+            [ "name" .= ("add" :: Text)
+            , "description" .= ("Addition tool" :: Text)
+            , "inputSchema" .= Aeson.object
+                [ "type" .= ("object" :: Text)
+                , "properties" .= Aeson.object
+                    [ "a" .= Aeson.object ["type" .= ("number" :: Text)]
+                    , "b" .= Aeson.object ["type" .= ("number" :: Text)]
+                    ]
+                , "required" .= (["a", "b"] :: [Text])
+                ]
+            ]
+          ]
+      ]
+
+  "tools/call" -> do
+    let obj = case params of { Object o -> o; _ -> KM.empty }
+        toolName = case KM.lookup "name" obj of { Just (String n) -> n; _ -> "" }
+        args = case KM.lookup "arguments" obj of
+          Just (Object a) -> Just $ Map.fromList [(Key.toText k, v) | (k, v) <- KM.toList a]
+          _ -> Nothing
+    case toolName of
+      "echo" ->
+        let msg = case args >>= Map.lookup "message" of
+              Just (String t) -> t
+              _ -> "?"
+        in respond $ toJSON $ Aeson.object
+              [ "content" .= [Aeson.object ["type" .= ("text" :: Text), "text" .= msg]]
+              ]
+      "add" ->
+        let a = maybe 0 (\v -> case v of { Number n -> round n; _ -> 0 }) (args >>= Map.lookup "a") :: Int
+            b = maybe 0 (\v -> case v of { Number n -> round n; _ -> 0 }) (args >>= Map.lookup "b") :: Int
+        in respond $ toJSON $ Aeson.object
+              [ "content" .= [Aeson.object ["type" .= ("text" :: Text), "text" .= T.pack (show (a + b))]]
+              , "structuredContent" .= Aeson.object ["result" .= (a + b)]
+              ]
+      _ -> respondError 404 "Tool not found"
+
+  "resources/list" ->
+    respond $ toJSON $ Aeson.object
+      [ "resources" .= [Aeson.object
+          [ "uri" .= ("resource://test/hello" :: Text)
+          , "name" .= ("hello" :: Text)
+          ]]
+      ]
+
+  "resources/read" -> do
+    let uri = case params of
+          Object o -> case KM.lookup "uri" o of { Just (String u) -> u; _ -> "" }
+          _ -> ""
+    if uri == "resource://test/hello"
+      then respond $ toJSON $ Aeson.object
+        [ "contents" .= [Aeson.object
+            [ "uri" .= ("resource://test/hello" :: Text)
+            , "text" .= ("Hello, world!" :: Text)
+            ]]
+        ]
+      else respondError 404 "Resource not found"
+
+  "resources/subscribe" -> respond (Aeson.object [])
+  "resources/unsubscribe" -> respond (Aeson.object [])
+
+  "resources/templates/list" ->
+    respond $ toJSON $ Aeson.object ["resourceTemplates" .= ([] :: [Value])]
+
+  "prompts/list" ->
+    respond $ toJSON $ Aeson.object
+      [ "prompts" .= [Aeson.object
+          [ "name" .= ("greet" :: Text)
+          , "description" .= ("A greeting prompt" :: Text)
+          , "arguments" .= [Aeson.object
+              [ "name" .= ("name" :: Text)
+              , "required" .= True
+              ]]
+          ]]
+      ]
+
+  "prompts/get" -> do
+    let name = case params of
+          Object o -> case KM.lookup "name" o of { Just (String n) -> n; _ -> "" }
+          _ -> ""
+    if name == "greet"
+      then respond $ toJSON $ Aeson.object
+        [ "description" .= ("A greeting prompt" :: Text)
+        , "messages" .= [Aeson.object
+            [ "role" .= ("user" :: Text)
+            , "content" .= Aeson.object ["type" .= ("text" :: Text), "text" .= ("Hello!" :: Text)]
+            ]]
+        ]
+      else respondError 404 "Prompt not found"
+
+  "completion/complete" -> respondError (-32601) "Method not found"
+
+  "logging/setLevel" -> respond (Aeson.object [])
+
+  _ -> respondError (-32601) ("Method not found: " <> method)
+
 -- * Test Infrastructure
 
--- | Create a minimal test server state.
-createTestServerState :: MCPServerState
-createTestServerState =
-  MCPServerState
-    { mcp_server_initialized = False
-    , mcp_handler_state = ()
-    , mcp_handler_init = Nothing
-    , mcp_handler_finalize = Nothing
-    , mcp_client_capabilities = Nothing
-    , mcp_log_level = Nothing
-    , mcp_pending_responses = mempty
-    , mcp_pending_responses_next = 1
-    , mcp_server_capabilities =
-        ServerCapabilities
-          { logging = Just LoggingCapability
-          , prompts = Just (PromptsCapability{listChanged = Nothing})
-          , resources = Just (ResourcesCapability{listChanged = Nothing, subscribe = Nothing})
-          , tools = Just (ToolsCapability{listChanged = Just True})
-          , completions = Nothing
-          , experimental = Nothing
-          }
-    , mcp_implementation = Implementation "test-server" "1.0.0" Nothing
-    , mcp_instructions = Nothing
-    , mcp_process_handlers = testHandlers
-    }
-
-testHandlers :: ProcessHandlers
-testHandlers =
-  withToolHandlers testTools $
-    defaultProcessHandlers
-      { listResourcesHandler = Just handleListResources
-      , readResourceHandler = Just handleReadResource
-      , listPromptsHandler = Just handleListPrompts
-      , getPromptHandler = Just handleGetPrompt
-      }
-
-testTools :: [ToolHandler]
-testTools =
-  [ toolHandler "echo" (Just "Echo tool") echoSchema echoHandler
-  , toolHandler "add" (Just "Addition tool") addSchema addHandler
-  ]
- where
-  echoSchema = InputSchema "object" (Map.fromList [("message", toJSON ("string" :: Text))]) ["message"]
-  echoHandler args =
-    case args >>= Map.lookup "message" of
-      Just msg ->
-        return $ ProcessSuccess $ CallToolResult
-          { content = [TextBlock (TextContent "text" (case msg of { Aeson.String t -> t; _ -> "?" }) Nothing Nothing)]
-          , structuredContent = Nothing
-          , isError = Nothing
-          , _meta = Nothing
-          }
-      Nothing ->
-        return $ ProcessSuccess $ toolTextError "Missing message"
-
-  addSchema = InputSchema "object" (Map.fromList [("a", toJSON ("number" :: Text)), ("b", toJSON ("number" :: Text))]) ["a", "b"]
-  addHandler args = do
-    let a = maybe 0 (\v -> case v of { Aeson.Number n -> round n; _ -> 0 }) (args >>= Map.lookup "a") :: Int
-        b = maybe 0 (\v -> case v of { Aeson.Number n -> round n; _ -> 0 }) (args >>= Map.lookup "b") :: Int
-    return $ ProcessSuccess $ CallToolResult
-      { content = [TextBlock (TextContent "text" (T.pack $ show (a + b)) Nothing Nothing)]
-      , structuredContent = Just (Map.fromList [("result", toJSON (a + b))])
-      , isError = Nothing
-      , _meta = Nothing
-      }
-
-handleListResources :: ListResourcesParams -> MCPServerT (ProcessResult ListResourcesResult)
-handleListResources _ =
-  return $ ProcessSuccess $ ListResourcesResult
-    { resources = [Resource "resource://test/hello" "hello" Nothing Nothing Nothing Nothing Nothing Nothing]
-    , nextCursor = Nothing
-    , _meta = Nothing
-    }
-
-handleReadResource :: ReadResourceParams -> MCPServerT (ProcessResult ReadResourceResult)
-handleReadResource (ReadResourceParams uri) =
-  if uri == "resource://test/hello"
-    then return $ ProcessSuccess $ ReadResourceResult
-      { contents = [TextResource (TextResourceContents "resource://test/hello" "Hello, world!" Nothing Nothing)]
-      , _meta = Nothing
-      }
-    else return $ ProcessRPCError 404 "Resource not found"
-
-handleListPrompts :: ListPromptsParams -> MCPServerT (ProcessResult ListPromptsResult)
-handleListPrompts _ =
-  return $ ProcessSuccess $ ListPromptsResult
-    { prompts = [Prompt "greet" Nothing (Just "A greeting prompt") (Just [PromptArgument "name" Nothing Nothing (Just True)]) Nothing]
-    , nextCursor = Nothing
-    , _meta = Nothing
-    }
-
-handleGetPrompt :: GetPromptParams -> MCPServerT (ProcessResult GetPromptResult)
-handleGetPrompt (GetPromptParams name _args) =
-  if name == "greet"
-    then return $ ProcessSuccess $ GetPromptResult
-      { description = Just "A greeting prompt"
-      , messages = [PromptMessage User (TextBlock (TextContent "text" "Hello!" Nothing Nothing))]
-      , _meta = Nothing
-      }
-    else return $ ProcessRPCError 404 "Prompt not found"
-
--- | Bracket that creates pipes, starts a stdio server, and yields a Transport.
+-- | Bracket that creates pipes, starts a mock server, and yields a Transport.
 withTestServer :: (Transport -> IO a) -> IO a
 withTestServer f = do
-  (client_to_server_read, client_to_server_write) <- createPipe
-  (server_to_client_read, server_to_client_write) <- createPipe
+  (clientToServerRead, clientToServerWrite) <- createPipe
+  (serverToClientRead, serverToClientWrite) <- createPipe
 
-  hSetBuffering client_to_server_write LineBuffering
-  hSetBuffering server_to_client_read LineBuffering
+  hSetBuffering clientToServerWrite LineBuffering
+  hSetBuffering serverToClientRead LineBuffering
+  hSetBuffering clientToServerRead LineBuffering
+  hSetBuffering serverToClientWrite LineBuffering
 
   bracket
     ( do
-        tid <- forkIO $ serveStdio client_to_server_read server_to_client_write createTestServerState
+        tid <- forkIO $ mockServer clientToServerRead serverToClientWrite
+                          `catch` \(_ :: SomeException) -> return ()
         threadDelay 10000
         return tid
     )
     ( \tid -> do
         killThread tid
-        hClose client_to_server_write
-        hClose client_to_server_read
-        hClose server_to_client_write
-        hClose server_to_client_read
+        hClose clientToServerWrite
+        hClose clientToServerRead
+        hClose serverToClientWrite
+        hClose serverToClientRead
     )
     ( \_ ->
         f
           Transport
             { transport_send = \msg -> do
-                BSL.hPut client_to_server_write (Aeson.encode msg)
-                BSL.hPut client_to_server_write "\n"
-                hFlush client_to_server_write
+                BSL.hPut clientToServerWrite (Aeson.encode msg)
+                BSL.hPut clientToServerWrite "\n"
+                hFlush clientToServerWrite
             , transport_receive = do
-                eof <- hIsEOF server_to_client_read
+                eof <- hIsEOF serverToClientRead
                 if eof
                   then return Nothing
                   else do
-                    line <- BS.hGetLine server_to_client_read
+                    line <- BS.hGetLine serverToClientRead
                     case Aeson.eitherDecodeStrict' line of
                       Right msg -> return (Just msg)
                       Left _ -> return Nothing
@@ -221,7 +292,6 @@ pingSpec = describe "Ping" $ do
   it "pings the server" $ do
     withInitializedClient $ \session -> do
       ping session
-      -- If we get here without exception, the ping succeeded
 
 toolSpec :: Spec
 toolSpec = describe "Tools" $ do
@@ -260,8 +330,9 @@ resourceSpec = describe "Resources" $ do
     withInitializedClient $ \session -> do
       ListResourcesResult{resources = rs} <- listResources session Nothing
       length rs `shouldBe` 1
-      let Resource{uri = u} = head rs
-      u `shouldBe` "resource://test/hello"
+      case rs of
+        (Resource{uri = u} : _) -> u `shouldBe` "resource://test/hello"
+        [] -> expectationFailure "Expected at least one resource"
 
   it "reads a resource" $ do
     withInitializedClient $ \session -> do
@@ -309,7 +380,6 @@ promptSpec = describe "Prompts" $ do
 completionSpec :: Spec
 completionSpec = describe "Completions" $ do
   it "handles completion when server has no completions capability" $ do
-    -- The server declared no completion handler, so this should get method_not_found
     withInitializedClient $ \session -> do
       result <- try @MCPClientError $
         complete session $
@@ -320,12 +390,11 @@ completionSpec = describe "Completions" $ do
             }
       case result of
         Left (RPCError _ _ _) -> return ()
-        Right _ -> return () -- some servers may return empty
-        _ -> expectationFailure "Unexpected result"
+        Right _ -> return ()
+        Left _ -> expectationFailure "Unexpected error type"
 
 loggingSpec :: Spec
 loggingSpec = describe "Logging" $ do
   it "sets logging level" $ do
     withInitializedClient $ \session -> do
       setLoggingLevel session Debug
-      -- Success if no exception
