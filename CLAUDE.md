@@ -21,9 +21,18 @@ nix develop
 # Run all tests
 nix develop --command cabal test
 
-# Run tests with coverage (uncomment -fhpc flag in baldr.cabal first)
-cabal test --enable-coverage
+# Run tests with coverage
+nix develop --command cabal test --enable-coverage
 
 # Run specific test module (tests are in test/ directory)
 cabal test --test-options="--match FooSpec"
 ```
+
+### Code Coverage
+
+100% test coverage is required. Coverage thresholds are defined in `.coverage-thresholds.json` — this is the single source of truth.
+
+- **Enforcement:** Coverage gates block PR creation and task completion
+- **Command:** `nix develop --command cabal test --enable-coverage` (or `make coverage`)
+- **CI:** Coverage reports are generated and deployed to GitHub Pages on every push/PR
+- If a GitHub Issue specifies different thresholds, update `.coverage-thresholds.json` first
