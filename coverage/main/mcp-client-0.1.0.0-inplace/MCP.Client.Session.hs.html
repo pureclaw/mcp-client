@@ -1,0 +1,301 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE ScopedTypeVariables #-}
+<span class="lineno">    2 </span>
+<span class="lineno">    3 </span>module MCP.Client.Session (
+<span class="lineno">    4 </span>  ClientSession,
+<span class="lineno">    5 </span>  withClientSession,
+<span class="lineno">    6 </span>  initialize,
+<span class="lineno">    7 </span>  sessionServerCapabilities,
+<span class="lineno">    8 </span>  sessionServerInfo,
+<span class="lineno">    9 </span>  sendRequest,
+<span class="lineno">   10 </span>  sendNotification,
+<span class="lineno">   11 </span>) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Control.Concurrent (forkIO, killThread)
+<span class="lineno">   14 </span>import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+<span class="lineno">   15 </span>import Control.Exception (SomeException, bracket, throwIO, try)
+<span class="lineno">   16 </span>import Data.Aeson (FromJSON, ToJSON, Value, toJSON)
+<span class="lineno">   17 </span>import Data.Aeson qualified as Aeson
+<span class="lineno">   18 </span>import Data.IORef (
+<span class="lineno">   19 </span>  IORef,
+<span class="lineno">   20 </span>  atomicModifyIORef',
+<span class="lineno">   21 </span>  newIORef,
+<span class="lineno">   22 </span>  readIORef,
+<span class="lineno">   23 </span>  writeIORef,
+<span class="lineno">   24 </span> )
+<span class="lineno">   25 </span>import Data.IntMap.Strict (IntMap)
+<span class="lineno">   26 </span>import Data.IntMap.Strict qualified as IM
+<span class="lineno">   27 </span>import Data.Text (Text)
+<span class="lineno">   28 </span>import Data.Text qualified as T
+<span class="lineno">   29 </span>import JSONRPC hiding (id, method, params, result)
+<span class="lineno">   30 </span>import MCP.Client.Config (ClientConfig (..))
+<span class="lineno">   31 </span>import MCP.Client.Error (MCPClientError (..))
+<span class="lineno">   32 </span>import MCP.Client.Transport (Transport (..))
+<span class="lineno">   33 </span>import MCP.Protocol
+<span class="lineno">   34 </span>  ( InitializeParams(..)
+<span class="lineno">   35 </span>  , InitializeResult(..)
+<span class="lineno">   36 </span>  , pROTOCOL_VERSION
+<span class="lineno">   37 </span>  )
+<span class="lineno">   38 </span>import MCP.Types
+<span class="lineno">   39 </span>import System.Timeout (timeout)
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | An active MCP client session over a 'Transport'.
+<span class="lineno">   42 </span>data ClientSession = ClientSession
+<span class="lineno">   43 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">session_transport</span></span></span> :: Transport
+<span class="lineno">   44 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">session_config</span></span></span> :: ClientConfig
+<span class="lineno">   45 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">session_next_id</span></span></span> :: IORef Int
+<span class="lineno">   46 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">session_pending</span></span></span> :: IORef (IntMap (MVar (Either JSONRPCErrorInfo Value)))
+<span class="lineno">   47 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">session_server_caps</span></span></span> :: IORef (Maybe ServerCapabilities)
+<span class="lineno">   48 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">session_server_info</span></span></span> :: IORef (Maybe Implementation)
+<span class="lineno">   49 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">session_initialized</span></span></span> :: IORef Bool
+<span class="lineno">   50 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">session_closed</span></span></span> :: IORef Bool
+<span class="lineno">   51 </span>  }
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>-- | Run an action with a client session.
+<span class="lineno">   54 </span>--
+<span class="lineno">   55 </span>-- Starts a background receive loop that dispatches server responses,
+<span class="lineno">   56 </span>-- requests, and notifications.  On exit the receive thread is killed and
+<span class="lineno">   57 </span>-- all pending requests are failed with 'SessionClosed'.
+<span class="lineno">   58 </span>withClientSession :: Transport -&gt; ClientConfig -&gt; (ClientSession -&gt; IO a) -&gt; IO a
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">withClientSession transport cfg action = do</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">session &lt;- newSession transport cfg</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">bracket</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">(forkIO $ receiveLoop session)</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">( \tid -&gt; do</span>
+<span class="lineno">   64 </span><span class="spaces">        </span><span class="istickedoff">killThread tid</span>
+<span class="lineno">   65 </span><span class="spaces">        </span><span class="istickedoff">writeIORef (session_closed session) True</span>
+<span class="lineno">   66 </span><span class="spaces">        </span><span class="istickedoff">failAllPending session</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">)</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">(const $ action session)</span></span>
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | Perform the MCP initialization handshake.
+<span class="lineno">   71 </span>--
+<span class="lineno">   72 </span>-- Sends @initialize@, validates the server's protocol version, stores
+<span class="lineno">   73 </span>-- the server capabilities, and sends @notifications\/initialized@.
+<span class="lineno">   74 </span>initialize :: ClientSession -&gt; IO InitializeResult
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">initialize session = do</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">let cfg = session_config session</span>
+<span class="lineno">   77 </span><span class="spaces">      </span><span class="istickedoff">params =</span>
+<span class="lineno">   78 </span><span class="spaces">        </span><span class="istickedoff">InitializeParams</span>
+<span class="lineno">   79 </span><span class="spaces">          </span><span class="istickedoff">{ protocolVersion = pROTOCOL_VERSION</span>
+<span class="lineno">   80 </span><span class="spaces">          </span><span class="istickedoff">, capabilities = config_capabilities cfg</span>
+<span class="lineno">   81 </span><span class="spaces">          </span><span class="istickedoff">, clientInfo = config_client_info cfg</span>
+<span class="lineno">   82 </span><span class="spaces">          </span><span class="istickedoff">}</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- sendRequest session &quot;initialize&quot; (toJSON params)</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">case Aeson.fromJSON result of</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">Aeson.Error err -&gt; <span class="nottickedoff">throwIO $ DecodeError (T.pack err)</span></span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">Aeson.Success (ir :: InitializeResult) -&gt; do</span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="istickedoff">let InitializeResult{protocolVersion = sv} = ir</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">if sv /= pROTOCOL_VERSION</span>
+<span class="lineno">   89 </span><span class="spaces">        </span><span class="istickedoff">then throwIO $ ProtocolVersionMismatch pROTOCOL_VERSION sv</span>
+<span class="lineno">   90 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">   91 </span><span class="spaces">          </span><span class="istickedoff">let InitializeResult</span>
+<span class="lineno">   92 </span><span class="spaces">                </span><span class="istickedoff">{ capabilities = caps</span>
+<span class="lineno">   93 </span><span class="spaces">                </span><span class="istickedoff">, serverInfo = info</span>
+<span class="lineno">   94 </span><span class="spaces">                </span><span class="istickedoff">} = ir</span>
+<span class="lineno">   95 </span><span class="spaces">          </span><span class="istickedoff">writeIORef (session_server_caps session) (Just <span class="nottickedoff">caps</span>)</span>
+<span class="lineno">   96 </span><span class="spaces">          </span><span class="istickedoff">writeIORef (session_server_info session) (Just info)</span>
+<span class="lineno">   97 </span><span class="spaces">          </span><span class="istickedoff">writeIORef (session_initialized session) <span class="nottickedoff">True</span></span>
+<span class="lineno">   98 </span><span class="spaces">          </span><span class="istickedoff">-- Send initialized notification</span>
+<span class="lineno">   99 </span><span class="spaces">          </span><span class="istickedoff">sendNotification session $</span>
+<span class="lineno">  100 </span><span class="spaces">            </span><span class="istickedoff">NotificationMessage $</span>
+<span class="lineno">  101 </span><span class="spaces">              </span><span class="istickedoff">JSONRPCNotification rPC_VERSION &quot;notifications/initialized&quot; Aeson.Null</span>
+<span class="lineno">  102 </span><span class="spaces">          </span><span class="istickedoff">return ir</span></span>
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Server capabilities received during initialization, if any.
+<span class="lineno">  105 </span>sessionServerCapabilities :: ClientSession -&gt; IO (Maybe ServerCapabilities)
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">sessionServerCapabilities = readIORef . session_server_caps</span></span>
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>-- | Server info received during initialization, if any.
+<span class="lineno">  109 </span>sessionServerInfo :: ClientSession -&gt; IO (Maybe Implementation)
+<span class="lineno">  110 </span><span class="decl"><span class="istickedoff">sessionServerInfo = readIORef . session_server_info</span></span>
+<span class="lineno">  111 </span>
+<span class="lineno">  112 </span>-- * Internal
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>newSession :: Transport -&gt; ClientConfig -&gt; IO ClientSession
+<span class="lineno">  115 </span><span class="decl"><span class="istickedoff">newSession transport cfg = do</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">next_id &lt;- newIORef 1</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">pending &lt;- newIORef IM.empty</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">caps &lt;- newIORef Nothing</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">info &lt;- newIORef Nothing</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">inited &lt;- newIORef <span class="nottickedoff">False</span></span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">closed &lt;- newIORef False</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">return</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">ClientSession</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">{ session_transport = transport</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">, session_config = cfg</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">, session_next_id = next_id</span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff">, session_pending = pending</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">, session_server_caps = caps</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">, session_server_info = info</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="istickedoff">, session_initialized = inited</span>
+<span class="lineno">  131 </span><span class="spaces">      </span><span class="istickedoff">, session_closed = closed</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">}</span></span>
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- | Send a JSON-RPC request and block until the response arrives.
+<span class="lineno">  135 </span>sendRequest :: ClientSession -&gt; Text -&gt; Value -&gt; IO Value
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">sendRequest session method params = do</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">closed &lt;- readIORef (session_closed session)</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">if closed</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">then throwIO SessionClosed</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">(req_id_int, mvar) &lt;- registerPending session</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">let req_id = RequestId (toJSON req_id_int)</span>
+<span class="lineno">  143 </span><span class="spaces">          </span><span class="istickedoff">msg =</span>
+<span class="lineno">  144 </span><span class="spaces">            </span><span class="istickedoff">RequestMessage $</span>
+<span class="lineno">  145 </span><span class="spaces">              </span><span class="istickedoff">JSONRPCRequest rPC_VERSION req_id method params</span>
+<span class="lineno">  146 </span><span class="spaces">      </span><span class="istickedoff">transport_send (session_transport session) msg</span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="istickedoff">let timeout_us = config_request_timeout_us (session_config session)</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">result &lt;-</span>
+<span class="lineno">  149 </span><span class="spaces">        </span><span class="istickedoff">if <span class="tickonlyfalse">timeout_us &lt;= 0</span></span>
+<span class="lineno">  150 </span><span class="spaces">          </span><span class="istickedoff">then <span class="nottickedoff">Just &lt;$&gt; takeMVar mvar</span></span>
+<span class="lineno">  151 </span><span class="spaces">          </span><span class="istickedoff">else timeout timeout_us (takeMVar mvar)</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">-- Clean up pending entry</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">atomicModifyIORef' (session_pending session) $ \m -&gt;</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="istickedoff">(IM.delete req_id_int m, ())</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">case result of</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; throwIO $ RequestTimeout <span class="nottickedoff">req_id</span></span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="istickedoff">Just (Left (JSONRPCErrorInfo err_code err_msg err_data)) -&gt;</span>
+<span class="lineno">  158 </span><span class="spaces">          </span><span class="istickedoff">throwIO $ RPCError err_code <span class="nottickedoff">err_msg</span> <span class="nottickedoff">err_data</span></span>
+<span class="lineno">  159 </span><span class="spaces">        </span><span class="istickedoff">Just (Right val) -&gt; return val</span></span>
+<span class="lineno">  160 </span>
+<span class="lineno">  161 </span>-- | Send a notification (fire-and-forget, no response expected).
+<span class="lineno">  162 </span>sendNotification :: ClientSession -&gt; JSONRPCMessage -&gt; IO ()
+<span class="lineno">  163 </span><span class="decl"><span class="istickedoff">sendNotification session msg =</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">transport_send (session_transport session) msg</span></span>
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>-- | Allocate a fresh request ID and MVar for the response.
+<span class="lineno">  167 </span>registerPending :: ClientSession -&gt; IO (Int, MVar (Either JSONRPCErrorInfo Value))
+<span class="lineno">  168 </span><span class="decl"><span class="istickedoff">registerPending session = do</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">mvar &lt;- newEmptyMVar</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">req_id &lt;- atomicModifyIORef' (session_next_id session) $ \n -&gt; (n + 1, n)</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">atomicModifyIORef' (session_pending session) $ \m -&gt;</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">(IM.insert req_id mvar m, ())</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">return (req_id, mvar)</span></span>
+<span class="lineno">  174 </span>
+<span class="lineno">  175 </span>-- | Fill all pending MVars with a 'SessionClosed' error so no thread hangs.
+<span class="lineno">  176 </span>failAllPending :: ClientSession -&gt; IO ()
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">failAllPending session = do</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="istickedoff">pending &lt;- atomicModifyIORef' (session_pending session) $ \m -&gt; (IM.empty, m)</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">err = JSONRPCErrorInfo iNTERNAL_ERROR &quot;Session closed&quot; Nothing</span></span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="istickedoff">mapM_ <span class="nottickedoff">(\mvar -&gt; putMVar mvar (Left err))</span> pending</span></span>
+<span class="lineno">  181 </span>
+<span class="lineno">  182 </span>-- | Background loop reading from the transport and dispatching messages.
+<span class="lineno">  183 </span>receiveLoop :: ClientSession -&gt; IO ()
+<span class="lineno">  184 </span><span class="decl"><span class="istickedoff">receiveLoop session = do</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="istickedoff">mb_msg &lt;- try $ transport_receive (session_transport session)</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="istickedoff">case mb_msg of</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="istickedoff">Left (_ :: SomeException) -&gt; return <span class="nottickedoff">()</span></span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="istickedoff">Right Nothing -&gt; <span class="nottickedoff">return ()</span></span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">Right (Just msg) -&gt; do</span>
+<span class="lineno">  190 </span><span class="spaces">      </span><span class="istickedoff">dispatchMessage session msg</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">receiveLoop session</span></span>
+<span class="lineno">  192 </span>
+<span class="lineno">  193 </span>-- | Route an incoming message to the appropriate handler.
+<span class="lineno">  194 </span>dispatchMessage :: ClientSession -&gt; JSONRPCMessage -&gt; IO ()
+<span class="lineno">  195 </span><span class="decl"><span class="istickedoff">dispatchMessage session = \case</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">ResponseMessage (JSONRPCResponse _ req_id result_val) -&gt;</span>
+<span class="lineno">  197 </span><span class="spaces">    </span><span class="istickedoff">deliverResponse session req_id (Right result_val)</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">ErrorMessage (JSONRPCError _ req_id err_info) -&gt;</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="istickedoff">deliverResponse session req_id (Left err_info)</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">RequestMessage (JSONRPCRequest _ req_id method params) -&gt;</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">handleServerRequest session req_id method <span class="nottickedoff">params</span></span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">NotificationMessage (JSONRPCNotification _ method params) -&gt;</span>
+<span class="lineno">  203 </span><span class="spaces">    </span><span class="istickedoff">handleServerNotification session method params</span></span>
+<span class="lineno">  204 </span>
+<span class="lineno">  205 </span>-- | Deliver a response to the waiting caller.
+<span class="lineno">  206 </span>deliverResponse :: ClientSession -&gt; RequestId -&gt; Either JSONRPCErrorInfo Value -&gt; IO ()
+<span class="lineno">  207 </span><span class="decl"><span class="istickedoff">deliverResponse session (RequestId req_id_val) result = do</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">let mb_int = case req_id_val of</span>
+<span class="lineno">  209 </span><span class="spaces">        </span><span class="istickedoff">Aeson.Number n -&gt; Just (round n :: Int)</span>
+<span class="lineno">  210 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">case mb_int of</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">return ()</span></span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">Just req_id_int -&gt; do</span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="istickedoff">mb_mvar &lt;- atomicModifyIORef' (session_pending session) $ \m -&gt;</span>
+<span class="lineno">  215 </span><span class="spaces">        </span><span class="istickedoff">case IM.lookup req_id_int m of</span>
+<span class="lineno">  216 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">(m, Nothing)</span></span>
+<span class="lineno">  217 </span><span class="spaces">          </span><span class="istickedoff">Just mvar -&gt; (IM.delete req_id_int m, Just mvar)</span>
+<span class="lineno">  218 </span><span class="spaces">      </span><span class="istickedoff">case mb_mvar of</span>
+<span class="lineno">  219 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">return ()</span></span>
+<span class="lineno">  220 </span><span class="spaces">        </span><span class="istickedoff">Just mvar -&gt; putMVar mvar result</span></span>
+<span class="lineno">  221 </span>
+<span class="lineno">  222 </span>-- | Handle a request from the server (ping, sampling, roots, elicitation).
+<span class="lineno">  223 </span>handleServerRequest :: ClientSession -&gt; RequestId -&gt; Text -&gt; Value -&gt; IO ()
+<span class="lineno">  224 </span><span class="decl"><span class="istickedoff">handleServerRequest session req_id method params = do</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">cfg = session_config session</span></span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">send_response val =</span>
+<span class="lineno">  227 </span><span class="spaces">        </span><span class="istickedoff">sendNotificationRaw session $</span>
+<span class="lineno">  228 </span><span class="spaces">          </span><span class="istickedoff">ResponseMessage $ JSONRPCResponse rPC_VERSION req_id val</span>
+<span class="lineno">  229 </span><span class="spaces">      </span><span class="istickedoff">send_error err_code err_msg =</span>
+<span class="lineno">  230 </span><span class="spaces">        </span><span class="istickedoff">sendNotificationRaw session $</span>
+<span class="lineno">  231 </span><span class="spaces">          </span><span class="istickedoff">ErrorMessage $</span>
+<span class="lineno">  232 </span><span class="spaces">            </span><span class="istickedoff">JSONRPCError rPC_VERSION req_id (JSONRPCErrorInfo err_code err_msg Nothing)</span>
+<span class="lineno">  233 </span><span class="spaces">      </span><span class="istickedoff">dispatch :: (FromJSON a, ToJSON b) =&gt; Maybe (a -&gt; IO b) -&gt; IO ()</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">dispatch Nothing = send_error mETHOD_NOT_FOUND (&quot;Method not found: &quot; &lt;&gt; method)</span></span>
+<span class="lineno">  235 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">dispatch (Just handler) =</span></span>
+<span class="lineno">  236 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">case Aeson.fromJSON params of</span></span>
+<span class="lineno">  237 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Aeson.Error err -&gt; send_error iNVALID_PARAMS (T.pack err)</span></span>
+<span class="lineno">  238 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Aeson.Success p -&gt; do</span></span>
+<span class="lineno">  239 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">result &lt;- handler p</span></span>
+<span class="lineno">  240 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">send_response (toJSON result)</span></span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">case method of</span>
+<span class="lineno">  242 </span><span class="spaces">    </span><span class="istickedoff">&quot;ping&quot; -&gt; send_response (Aeson.Object mempty)</span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="istickedoff">&quot;sampling/createMessage&quot; -&gt; <span class="nottickedoff">dispatch (config_on_create_message cfg)</span></span>
+<span class="lineno">  244 </span><span class="spaces">    </span><span class="istickedoff">&quot;roots/list&quot; -&gt; <span class="nottickedoff">dispatch (config_on_list_roots cfg)</span></span>
+<span class="lineno">  245 </span><span class="spaces">    </span><span class="istickedoff">&quot;elicitation/create&quot; -&gt; <span class="nottickedoff">dispatch (config_on_elicit cfg)</span></span>
+<span class="lineno">  246 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; send_error mETHOD_NOT_FOUND (&quot;Method not found: &quot; &lt;&gt; method)</span></span>
+<span class="lineno">  247 </span>
+<span class="lineno">  248 </span>-- | Handle a notification from the server.
+<span class="lineno">  249 </span>handleServerNotification :: ClientSession -&gt; Text -&gt; Value -&gt; IO ()
+<span class="lineno">  250 </span><span class="decl"><span class="istickedoff">handleServerNotification session method params = do</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">let cfg = session_config session</span>
+<span class="lineno">  252 </span><span class="spaces">      </span><span class="istickedoff">tryCall :: (FromJSON a) =&gt; Maybe (a -&gt; IO ()) -&gt; IO ()</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">tryCall Nothing = <span class="nottickedoff">callFallback</span></span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">tryCall (Just handler) =</span>
+<span class="lineno">  255 </span><span class="spaces">        </span><span class="istickedoff">case Aeson.fromJSON params of</span>
+<span class="lineno">  256 </span><span class="spaces">          </span><span class="istickedoff">Aeson.Error _ -&gt; <span class="nottickedoff">callFallback</span></span>
+<span class="lineno">  257 </span><span class="spaces">          </span><span class="istickedoff">Aeson.Success p -&gt; handler <span class="nottickedoff">p</span></span>
+<span class="lineno">  258 </span><span class="spaces">      </span><span class="istickedoff">callFallback =</span>
+<span class="lineno">  259 </span><span class="spaces">        </span><span class="istickedoff">case config_on_fallback cfg of</span>
+<span class="lineno">  260 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; return <span class="nottickedoff">()</span></span>
+<span class="lineno">  261 </span><span class="spaces">          </span><span class="istickedoff">Just fb -&gt; fb $ <span class="nottickedoff">NotificationMessage $ JSONRPCNotification rPC_VERSION method params</span></span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">case method of</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="istickedoff">&quot;notifications/progress&quot; -&gt; tryCall (config_on_progress cfg)</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">&quot;notifications/message&quot; -&gt; tryCall (config_on_logging_message cfg)</span>
+<span class="lineno">  265 </span><span class="spaces">    </span><span class="istickedoff">&quot;notifications/resources/updated&quot; -&gt; tryCall (config_on_resource_updated cfg)</span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="istickedoff">&quot;notifications/resources/list_changed&quot; -&gt;</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">maybe <span class="nottickedoff">callFallback</span> id (config_on_resource_list_changed cfg)</span>
+<span class="lineno">  268 </span><span class="spaces">    </span><span class="istickedoff">&quot;notifications/tools/list_changed&quot; -&gt;</span>
+<span class="lineno">  269 </span><span class="spaces">      </span><span class="istickedoff">maybe <span class="nottickedoff">callFallback</span> id (config_on_tool_list_changed cfg)</span>
+<span class="lineno">  270 </span><span class="spaces">    </span><span class="istickedoff">&quot;notifications/prompts/list_changed&quot; -&gt;</span>
+<span class="lineno">  271 </span><span class="spaces">      </span><span class="istickedoff">maybe <span class="nottickedoff">callFallback</span> id (config_on_prompt_list_changed cfg)</span>
+<span class="lineno">  272 </span><span class="spaces">    </span><span class="istickedoff">&quot;notifications/cancelled&quot; -&gt; tryCall (config_on_cancelled cfg)</span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; callFallback</span></span>
+<span class="lineno">  274 </span>
+<span class="lineno">  275 </span>-- | Raw send — used internally for responses to server requests.
+<span class="lineno">  276 </span>sendNotificationRaw :: ClientSession -&gt; JSONRPCMessage -&gt; IO ()
+<span class="lineno">  277 </span><span class="decl"><span class="istickedoff">sendNotificationRaw session msg =</span>
+<span class="lineno">  278 </span><span class="spaces">  </span><span class="istickedoff">transport_send (session_transport session) msg</span></span>
+
+</pre>
+</body>
+</html>

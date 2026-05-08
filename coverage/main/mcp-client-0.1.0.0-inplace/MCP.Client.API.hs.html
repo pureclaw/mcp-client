@@ -1,0 +1,180 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DuplicateRecordFields #-}
+<span class="lineno">    2 </span>{-# LANGUAGE ScopedTypeVariables #-}
+<span class="lineno">    3 </span>
+<span class="lineno">    4 </span>module MCP.Client.API (
+<span class="lineno">    5 </span>  -- * Client-to-server requests
+<span class="lineno">    6 </span>  ping,
+<span class="lineno">    7 </span>  listTools,
+<span class="lineno">    8 </span>  callTool,
+<span class="lineno">    9 </span>  listResources,
+<span class="lineno">   10 </span>  readResource,
+<span class="lineno">   11 </span>  subscribeResource,
+<span class="lineno">   12 </span>  unsubscribeResource,
+<span class="lineno">   13 </span>  listResourceTemplates,
+<span class="lineno">   14 </span>  listPrompts,
+<span class="lineno">   15 </span>  getPrompt,
+<span class="lineno">   16 </span>  complete,
+<span class="lineno">   17 </span>  setLoggingLevel,
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>  -- * Client-to-server notifications
+<span class="lineno">   20 </span>  sendCancelled,
+<span class="lineno">   21 </span>  sendProgress,
+<span class="lineno">   22 </span>  sendRootsListChanged,
+<span class="lineno">   23 </span>) where
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Control.Exception (throwIO)
+<span class="lineno">   26 </span>import Data.Aeson (FromJSON, Value, toJSON)
+<span class="lineno">   27 </span>import Data.Aeson qualified as Aeson
+<span class="lineno">   28 </span>import Data.Map (Map)
+<span class="lineno">   29 </span>import Data.Text (Text)
+<span class="lineno">   30 </span>import Data.Text qualified as T
+<span class="lineno">   31 </span>import JSONRPC hiding (id, method, params, result)
+<span class="lineno">   32 </span>import MCP.Client.Error (MCPClientError (..))
+<span class="lineno">   33 </span>import MCP.Client.Session (ClientSession)
+<span class="lineno">   34 </span>import MCP.Client.Session qualified as Session
+<span class="lineno">   35 </span>import MCP.Protocol
+<span class="lineno">   36 </span>  ( CancelledParams(CancelledParams)
+<span class="lineno">   37 </span>  , CompleteParams
+<span class="lineno">   38 </span>  , CompleteResult
+<span class="lineno">   39 </span>  , GetPromptParams(GetPromptParams)
+<span class="lineno">   40 </span>  , GetPromptResult
+<span class="lineno">   41 </span>  , ListPromptsParams(ListPromptsParams)
+<span class="lineno">   42 </span>  , ListPromptsResult
+<span class="lineno">   43 </span>  , ListResourceTemplatesParams(ListResourceTemplatesParams)
+<span class="lineno">   44 </span>  , ListResourceTemplatesResult
+<span class="lineno">   45 </span>  , ListResourcesParams(ListResourcesParams)
+<span class="lineno">   46 </span>  , ListResourcesResult
+<span class="lineno">   47 </span>  , ListToolsParams(ListToolsParams)
+<span class="lineno">   48 </span>  , ListToolsResult
+<span class="lineno">   49 </span>  , PingParams(PingParams)
+<span class="lineno">   50 </span>  , ProgressParams
+<span class="lineno">   51 </span>  , ReadResourceParams(ReadResourceParams)
+<span class="lineno">   52 </span>  , ReadResourceResult
+<span class="lineno">   53 </span>  , SetLevelParams(SetLevelParams)
+<span class="lineno">   54 </span>  , SubscribeParams(SubscribeParams)
+<span class="lineno">   55 </span>  , UnsubscribeParams(UnsubscribeParams)
+<span class="lineno">   56 </span>  , CallToolParams(CallToolParams)
+<span class="lineno">   57 </span>  , CallToolResult
+<span class="lineno">   58 </span>  )
+<span class="lineno">   59 </span>import MCP.Types (Cursor, LoggingLevel)
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- * Client-to-server requests
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Send a @ping@ request.
+<span class="lineno">   64 </span>ping :: ClientSession -&gt; IO ()
+<span class="lineno">   65 </span><span class="decl"><span class="istickedoff">ping session = do</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">(_ :: Value) &lt;- sendRequestTyped session &quot;ping&quot; (toJSON (PingParams Nothing))</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">return <span class="nottickedoff">()</span></span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | List available tools.  Pass 'Nothing' for the first page.
+<span class="lineno">   70 </span>listTools :: ClientSession -&gt; Maybe Cursor -&gt; IO ListToolsResult
+<span class="lineno">   71 </span><span class="decl"><span class="istickedoff">listTools session cursor =</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;tools/list&quot; (toJSON (ListToolsParams cursor))</span></span>
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | Call a tool by name with optional arguments.
+<span class="lineno">   75 </span>callTool :: ClientSession -&gt; Text -&gt; Maybe (Map Text Value) -&gt; IO CallToolResult
+<span class="lineno">   76 </span><span class="decl"><span class="istickedoff">callTool session name args =</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;tools/call&quot; (toJSON (CallToolParams name args))</span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | List available resources.  Pass 'Nothing' for the first page.
+<span class="lineno">   80 </span>listResources :: ClientSession -&gt; Maybe Cursor -&gt; IO ListResourcesResult
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">listResources session cursor =</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;resources/list&quot; (toJSON (ListResourcesParams cursor))</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>-- | Read a resource by URI.
+<span class="lineno">   85 </span>readResource :: ClientSession -&gt; Text -&gt; IO ReadResourceResult
+<span class="lineno">   86 </span><span class="decl"><span class="istickedoff">readResource session uri =</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;resources/read&quot; (toJSON (ReadResourceParams uri))</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | Subscribe to updates for a resource URI.
+<span class="lineno">   90 </span>subscribeResource :: ClientSession -&gt; Text -&gt; IO Value
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">subscribeResource session uri =</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;resources/subscribe&quot; (toJSON (SubscribeParams uri))</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | Unsubscribe from updates for a resource URI.
+<span class="lineno">   95 </span>unsubscribeResource :: ClientSession -&gt; Text -&gt; IO Value
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">unsubscribeResource session uri =</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;resources/unsubscribe&quot; (toJSON (UnsubscribeParams uri))</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | List available resource templates.  Pass 'Nothing' for the first page.
+<span class="lineno">  100 </span>listResourceTemplates :: ClientSession -&gt; Maybe Cursor -&gt; IO ListResourceTemplatesResult
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">listResourceTemplates session cursor =</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;resources/templates/list&quot; (toJSON (ListResourceTemplatesParams cursor))</span></span>
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | List available prompts.  Pass 'Nothing' for the first page.
+<span class="lineno">  105 </span>listPrompts :: ClientSession -&gt; Maybe Cursor -&gt; IO ListPromptsResult
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">listPrompts session cursor =</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;prompts/list&quot; (toJSON (ListPromptsParams cursor))</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | Get a prompt by name with optional arguments.
+<span class="lineno">  110 </span>getPrompt :: ClientSession -&gt; Text -&gt; Maybe (Map Text Text) -&gt; IO GetPromptResult
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">getPrompt session name args =</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;prompts/get&quot; (toJSON (GetPromptParams name args))</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | Request autocompletion.
+<span class="lineno">  115 </span>complete :: ClientSession -&gt; CompleteParams -&gt; IO CompleteResult
+<span class="lineno">  116 </span><span class="decl"><span class="istickedoff">complete session params =</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">sendRequestTyped session &quot;completion/complete&quot; (toJSON params)</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Set the server's logging level.
+<span class="lineno">  120 </span>setLoggingLevel :: ClientSession -&gt; LoggingLevel -&gt; IO ()
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">setLoggingLevel session level = do</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- Session.sendRequest session &quot;logging/setLevel&quot; (toJSON (SetLevelParams level))</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">return <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- * Client-to-server notifications
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | Notify the server that a request has been cancelled.
+<span class="lineno">  128 </span>sendCancelled :: ClientSession -&gt; RequestId -&gt; Maybe Text -&gt; IO ()
+<span class="lineno">  129 </span><span class="decl"><span class="nottickedoff">sendCancelled session req_id reason =</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="nottickedoff">Session.sendNotification session $</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="nottickedoff">NotificationMessage $</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="nottickedoff">JSONRPCNotification rPC_VERSION &quot;notifications/cancelled&quot; $</span>
+<span class="lineno">  133 </span><span class="spaces">        </span><span class="nottickedoff">toJSON (CancelledParams req_id reason)</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>-- | Send a progress notification to the server.
+<span class="lineno">  136 </span>sendProgress :: ClientSession -&gt; ProgressParams -&gt; IO ()
+<span class="lineno">  137 </span><span class="decl"><span class="nottickedoff">sendProgress session params =</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="nottickedoff">Session.sendNotification session $</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="nottickedoff">NotificationMessage $</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="nottickedoff">JSONRPCNotification rPC_VERSION &quot;notifications/progress&quot; $</span>
+<span class="lineno">  141 </span><span class="spaces">        </span><span class="nottickedoff">toJSON params</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | Notify the server that the client's root list has changed.
+<span class="lineno">  144 </span>sendRootsListChanged :: ClientSession -&gt; IO ()
+<span class="lineno">  145 </span><span class="decl"><span class="nottickedoff">sendRootsListChanged session =</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="nottickedoff">Session.sendNotification session $</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="nottickedoff">NotificationMessage $</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="nottickedoff">JSONRPCNotification rPC_VERSION &quot;notifications/roots/list_changed&quot; Aeson.Null</span></span>
+<span class="lineno">  149 </span>
+<span class="lineno">  150 </span>-- * Internal
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>sendRequestTyped :: (FromJSON a) =&gt; ClientSession -&gt; Text -&gt; Value -&gt; IO a
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">sendRequestTyped session method params = do</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">val &lt;- Session.sendRequest session method params</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">case Aeson.fromJSON val of</span>
+<span class="lineno">  156 </span><span class="spaces">    </span><span class="istickedoff">Aeson.Error err -&gt; <span class="nottickedoff">throwIO $ DecodeError (T.pack err)</span></span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">Aeson.Success a -&gt; return a</span></span>
+
+</pre>
+</body>
+</html>
